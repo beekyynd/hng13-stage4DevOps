@@ -1,0 +1,609 @@
+#!/usr/bin/env python3
+
+"""
+vpcctl: A tool to build and manage Linux-based Virtual Private Clouds (VPCs)
+from first principles using network namespaces, bridges, veth pairs, and iptables.
+"""
+
+import argparse
+import subprocess
+import sys
+import os
+import json
+import shlex
+from ipaddress import ip_network, ip_address
+
+# --- Configuration ---
+STATE_DIR = "/tmp/vpcctl"
+
+# --- Utility Functions ---
+
+def run_cmd(command, check=True, capture_output=False, text=True, shell=False):
+    """
+    Executes a shell command and logs it.
+    Handles running as a list or a single string.
+    """
+    if not isinstance(command, list) and not shell:
+        command = shlex.split(command)
+    
+    log_cmd = command if isinstance(command, str) else ' '.join(command)
+    print(f"LOG: Executing: {log_cmd}")
+    
+    try:
+        return subprocess.run(
+            command, 
+            check=check, 
+            capture_output=capture_output, 
+            text=text,
+            shell=shell
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: Command failed: {log_cmd}", file=sys.stderr)
+        print(f"ERROR details: {e}", file=sys.stderr)
+        if not check:
+            return e
+        sys.exit(1)
+    except FileNotFoundError as e:
+        cmd_name = command if isinstance(command, str) else command[0]
+        print(f"ERROR: Command not found: {cmd_name}", file=sys.stderr)
+        print(f"ERROR details: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def run_in_ns(netns_name, command):
+    """Executes a command inside a specific network namespace."""
+    if not isinstance(command, list):
+        command = shlex.split(command)
+    
+    ns_command = ["sudo", "ip", "netns", "exec", f"ns-{netns_name}"] + command
+    return run_cmd(ns_command)
+
+def get_vpc_config(vpc_name):
+    """Loads a VPC's configuration from the state directory."""
+    config_path = os.path.join(STATE_DIR, vpc_name, "config.json")
+    if not os.path.exists(config_path):
+        print(f"ERROR: VPC '{vpc_name}' not found or config is missing.", file=sys.stderr)
+        sys.exit(1)
+    with open(config_path, 'r') as f:
+        return json.load(f)
+
+def save_vpc_config(vpc_name, config):
+    """Saves a VPC's configuration to the state directory."""
+    vpc_dir = os.path.join(STATE_DIR, vpc_name)
+    os.makedirs(vpc_dir, exist_ok=True)
+    config_path = os.path.join(vpc_dir, "config.json")
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+
+def get_gateway_ip(cidr):
+    """Gets the first usable IP (.1) from a CIDR for the gateway."""
+    network = ip_network(cidr)
+    return str(network.network_address + 1)
+
+def get_subnet_ip(cidr):
+    """Gets a sample IP (.10) from a CIDR for the namespace interface."""
+    network = ip_network(cidr)
+    # Use .10 as a convention for the first "instance" in the subnet
+    return str(network.network_address + 10)
+
+# --- Core VPC Functions ---
+
+def create_vpc(name, cidr):
+    """
+    Part 1: Core VPC Creation
+    Creates a new VPC, which is a Linux bridge acting as a router.
+    """
+    print(f"--- Creating VPC: {name} ({cidr}) ---")
+    bridge_name = f"br-{name}"
+    
+    # Check for existing
+    if os.path.exists(f"/sys/class/net/{bridge_name}"):
+        print(f"INFO: Bridge {bridge_name} already exists. Ensuring config is present.")
+    else:
+        # 1. Create the bridge (VPC router)
+        run_cmd(f"sudo ip link add {bridge_name} type bridge")
+        
+        # 2. Bring the bridge up (NO IP ASSIGNMENT HERE)
+        run_cmd(f"sudo ip link set {bridge_name} up")
+    
+    # 3. Enable IP forwarding on the host (for routing between subnets and NAT)
+    run_cmd("sudo sysctl -w net.ipv4.ip_forward=1")
+    
+    # 4. Set default FORWARD policy to DROP (VPC Isolation)
+    fw_policy = run_cmd("sudo iptables -L FORWARD -n", capture_output=True).stdout
+    if "policy DROP" not in fw_policy and "policy REJECT" not in fw_policy:
+         print("INFO: Setting default FORWARD policy to DROP for VPC isolation.")
+         run_cmd("sudo iptables -P FORWARD DROP")
+         run_cmd("sudo iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT", check=False)
+
+    # 5. Allow forwarding within the VPC (e.g., priv-a to pub-a)
+    fwd_comment_vpc = f"vpcctl-fwd-vpc-{name}"
+    fwd_rule_vpc = f"-s {cidr} -d {cidr} -j ACCEPT -m comment --comment {fwd_comment_vpc}"
+    check_fwd_vpc = f"sudo iptables -C FORWARD {fwd_rule_vpc}"
+    if run_cmd(check_fwd_vpc, check=False).returncode != 0:
+        run_cmd(f"sudo iptables -A FORWARD {fwd_rule_vpc}")
+
+    # 6. Save VPC state (ALWAYS do this, even if bridge existed)
+    config = {
+        "name": name,
+        "cidr": cidr,
+        "bridge_name": bridge_name,
+        "subnets": {}
+    }
+    save_vpc_config(name, config)
+    # Changed "created" to "configured" for accuracy
+    print(f"✅ VPC {name} configured with bridge {bridge_name}.")
+
+
+def create_subnet(vpc_name, subnet_name, subnet_cidr, subnet_type, internet_iface):
+    """
+    Part 1 & 2: Subnet Creation and NAT
+    Creates a network namespace (subnet) and connects it to the VPC bridge.
+    Configures NAT (Part 2) if type is 'public'.
+    """
+    print(f"--- Creating Subnet: {subnet_name} in VPC {vpc_name} ({subnet_cidr}) ---")
+    
+    # 1. Load VPC config
+    config = get_vpc_config(vpc_name)
+    vpc_bridge = config["bridge_name"]
+    
+    # 2. Define names
+    ns_name = f"ns-{subnet_name}"
+    veth_host = f"v-eth-{subnet_name}"
+    veth_peer = f"v-peer-{subnet_name}"
+    subnet_ip = get_subnet_ip(subnet_cidr) # e.g., 10.0.1.10
+    
+    # --- NEW LOGIC ---
+    # This subnet's gateway (e.g., 10.0.1.1)
+    subnet_gateway_ip = get_gateway_ip(subnet_cidr) 
+    subnet_prefix = ip_network(subnet_cidr).prefixlen
+    
+    # Idempotency check
+    if os.path.exists(f"/var/run/netns/{ns_name}"):
+        print(f"INFO: Namespace {ns_name} already exists. Skipping.")
+        return
+
+    # 3. Create the network namespace (the subnet)
+    run_cmd(f"sudo ip netns add {ns_name}")
+    
+    # 4. Create the veth pair (the cable)
+    run_cmd(f"sudo ip link add {veth_host} type veth peer name {veth_peer}")
+    
+    # 5. Attach one end to the VPC bridge
+    run_cmd(f"sudo ip link set {veth_host} master {vpc_bridge}")
+    
+    # 6. Attach the other end to the namespace
+    run_cmd(f"sudo ip link set {veth_peer} netns {ns_name}")
+    
+    # 7. Bring up the host-side veth
+    run_cmd(f"sudo ip link set {veth_host} up")
+
+    # --- NEW LOGIC ---
+    # 8. Assign this subnet's gateway IP to the BRIDGE
+    # This makes the bridge the router for this subnet
+    # We check if the IP is already there to be idempotent
+    check_ip_cmd = f"ip addr show {vpc_bridge} | grep -q '{subnet_gateway_ip}'"
+    if run_cmd(check_ip_cmd, check=False, shell=True).returncode != 0:
+        run_cmd(f"sudo ip addr add {subnet_gateway_ip}/{subnet_prefix} dev {vpc_bridge}")
+    
+    # 9. --- Configure inside the namespace ---
+    # 9a. Assign IP to the namespace's veth
+    run_in_ns(subnet_name, f"ip addr add {subnet_ip}/{subnet_prefix} dev {veth_peer}")
+    # 9b. Bring up the namespace-side veth
+    run_in_ns(subnet_name, f"ip link set {veth_peer} up")
+    # 9c. Bring up the loopback interface
+    run_in_ns(subnet_name, "ip link set lo up")
+    
+    # --- UPDATED LOGIC ---
+    # 9d. Add default route to THIS SUBNET's gateway
+    run_in_ns(subnet_name, f"ip route add default via {subnet_gateway_ip}")
+    
+    # 10. --- Part 2: NAT Gateway Configuration ---
+    if subnet_type == 'public':
+        if not internet_iface:
+            print("ERROR: --internet-iface is required for public subnets.", file=sys.stderr)
+            # Rollback namespace creation
+            run_cmd(f"sudo ip netns delete {ns_name}", check=False)
+            sys.exit(1)
+        
+        print(f"INFO: Configuring NAT for public subnet {subnet_name} via {internet_iface}")
+        
+        # 9a. Add MASQUERADE rule for NAT
+        nat_comment = f"vpcctl-nat-{subnet_name}"
+        nat_rule = f"-s {subnet_cidr} -o {internet_iface} -j MASQUERADE -m comment --comment {nat_comment}"
+        check_cmd = f"sudo iptables -t nat -C POSTROUTING {nat_rule}"
+        if run_cmd(check_cmd, check=False).returncode != 0:
+            run_cmd(f"sudo iptables -t nat -A POSTROUTING {nat_rule}")
+
+        # 9b. Add FORWARD rules to allow traffic from subnet to internet
+        fwd_comment_out = f"vpcctl-fwd-out-{subnet_name}"
+        fwd_rule_out = f"-s {subnet_cidr} -o {internet_iface} -j ACCEPT -m comment --comment {fwd_comment_out}"
+        check_fwd_out = f"sudo iptables -C FORWARD {fwd_rule_out}"
+        if run_cmd(check_fwd_out, check=False).returncode != 0:
+            run_cmd(f"sudo iptables -A FORWARD {fwd_rule_out}")
+
+        # 9c. Allow related/established back in
+        fwd_comment_in = f"vpcctl-fwd-in-{subnet_name}"
+        fwd_rule_in = f"-d {subnet_cidr} -i {internet_iface} -m state --state RELATED,ESTABLISHED -j ACCEPT -m comment --comment {fwd_comment_in}"
+        check_fwd_in = f"sudo iptables -C FORWARD {fwd_rule_in}"
+        if run_cmd(check_fwd_in, check=False).returncode != 0:
+            run_cmd(f"sudo iptables -A FORWARD {fwd_rule_in}")
+            
+    # 11. Save subnet info to config
+    config["subnets"][subnet_name] = {
+        "cidr": subnet_cidr,
+        "type": subnet_type,
+        "ip": subnet_ip,
+        "gateway_ip": subnet_gateway_ip, # Store the new gateway
+        "ns_name": ns_name,
+        "veth_host": veth_host,
+        "nat_iface": internet_iface if subnet_type == 'public' else None
+    }
+    save_vpc_config(vpc_name, config)
+    print(f"✅ Subnet {subnet_name} created in VPC {vpc_name}.")
+    
+    # --- UPDATED LOGIC ---
+    print(f"   -> Test with: sudo ./vpcctl exec -s {subnet_name} -- ping -c 1 {subnet_gateway_ip}")
+    if subnet_type == 'public':
+        print(f"   -> Test NAT with: sudo ./vpcctl exec -s {subnet_name} -- ping -c 1 8.8.8.8")
+
+def delete_vpc(vpc_name):
+    """
+    Part 5: Cleanup
+    Deletes a VPC and all its associated resources (subnets, rules, bridge).
+    """
+    print(f"--- Deleting VPC: {vpc_name} ---")
+    
+    try:
+        config = get_vpc_config(vpc_name)
+    except SystemExit:
+        print(f"INFO: No config found for VPC {vpc_name}. Checking for leftover resources...")
+        config = None
+
+    # 1. Delete subnets (namespaces) and NAT rules
+    if config and "subnets" in config:
+        for subnet_name, subnet_info in config["subnets"].items():
+            print(f"Deleting subnet: {subnet_name}")
+            
+            # 1a. Delete namespace
+            ns_name = subnet_info.get("ns_name", f"ns-{subnet_name}")
+            run_cmd(f"sudo ip netns delete {ns_name}", check=False)
+            
+            # 1b. Delete NAT/FORWARD rules (if public)
+            if subnet_info.get("type") == "public":
+                cidr = subnet_info.get("cidr")
+                iface = subnet_info.get("nat_iface")
+                
+                if not cidr or not iface:
+                    print(f"WARN: Missing info for {subnet_name}, skipping iptables cleanup.")
+                    continue
+
+                nat_comment = f"vpcctl-nat-{subnet_name}"
+                nat_rule = f"-s {cidr} -o {iface} -j MASQUERADE -m comment --comment {nat_comment}"
+                run_cmd(f"sudo iptables -t nat -D POSTROUTING {nat_rule}", check=False)
+                
+                fwd_comment_out = f"vpcctl-fwd-out-{subnet_name}"
+                fwd_rule_out = f"-s {cidr} -o {iface} -j ACCEPT -m comment --comment {fwd_comment_out}"
+                run_cmd(f"sudo iptables -D FORWARD {fwd_rule_out}", check=False)
+
+                fwd_comment_in = f"vpcctl-fwd-in-{subnet_name}"
+                fwd_rule_in = f"-d {cidr} -i {iface} -m state --state RELATED,ESTABLISHED -j ACCEPT -m comment --comment {fwd_comment_in}"
+                run_cmd(f"sudo iptables -D FORWARD {fwd_rule_in}", check=False)
+
+    # 2. Delete peering rules
+    print("Deleting peering rules...")
+    for chain_cmd in ["sudo iptables -L FORWARD -n", "sudo iptables -t nat -L POSTROUTING -n"]:
+        peer_rules = run_cmd(chain_cmd, capture_output=True, check=False).stdout
+        if f"vpcctl-peer-{vpc_name}" in peer_rules:
+            print("INFO: Manual peering rule cleanup may be required, or use 'cleanup-all'")
+            break
+
+    # --- NEW RULE ---
+    # 2b. Delete intra-VPC forwarding rule
+    if config:
+        cidr = config["cidr"]
+        fwd_comment_vpc = f"vpcctl-fwd-vpc-{vpc_name}"
+        fwd_rule_vpc = f"-s {cidr} -d {cidr} -j ACCEPT -m comment --comment {fwd_comment_vpc}"
+        run_cmd(f"sudo iptables -D FORWARD {fwd_rule_vpc}", check=False)
+    # --- END NEW RULE ---
+
+    # 3. Delete the bridge
+    bridge_name = config.get("bridge_name", f"br-{vpc_name}") if config else f"br-{vpc_name}"
+    if os.path.exists(f"/sys/class/net/{bridge_name}"):
+        run_cmd(f"sudo ip link set {bridge_name} down", check=False)
+        run_cmd(f"sudo ip link delete {bridge_name}", check=False)
+    
+    # 4. Delete state files
+    vpc_dir = os.path.join(STATE_DIR, vpc_name)
+    if os.path.exists(vpc_dir):
+        run_cmd(f"sudo rm -rf {vpc_dir}", check=False)
+    
+    print(f"✅ VPC {vpc_name} deleted.")
+
+def peer_vpcs(vpc1_name, vpc2_name):
+    """
+    Part 3: VPC Peering
+    Enables communication between two VPCs by adding iptables FORWARD rules.
+    """
+    print(f"--- Peering VPCs: {vpc1_name} <-> {vpc2_name} ---")
+    
+    # 1. Get CIDRs
+    vpc1_config = get_vpc_config(vpc1_name)
+    vpc2_config = get_vpc_config(vpc2_name)
+    vpc1_cidr = vpc1_config["cidr"]
+    vpc2_cidr = vpc2_config["cidr"]
+    
+    # 2. Add FORWARD rule for vpc1 -> vpc2
+    peer_comment1 = f"vpcctl-peer-{vpc1_name}-to-{vpc2_name}"
+    peer_rule1 = f"-s {vpc1_cidr} -d {vpc2_cidr} -j ACCEPT -m comment --comment {peer_comment1}"
+    check_peer1 = f"sudo iptables -C FORWARD {peer_rule1}"
+    if run_cmd(check_peer1, check=False).returncode != 0:
+        run_cmd(f"sudo iptables -A FORWARD {peer_rule1}")
+
+    # 3. Add FORWARD rule for vpc2 -> vpc1
+    peer_comment2 = f"vpcctl-peer-{vpc2_name}-to-{vpc1_name}"
+    peer_rule2 = f"-s {vpc2_cidr} -d {vpc1_cidr} -j ACCEPT -m comment --comment {peer_comment2}"
+    check_peer2 = f"sudo iptables -C FORWARD {peer_rule2}"
+    if run_cmd(check_peer2, check=False).returncode != 0:
+        run_cmd(f"sudo iptables -A FORWARD {peer_rule2}")
+
+    print(f"✅ Peering enabled between {vpc1_name} ({vpc1_cidr}) and {vpc2_name} ({vpc2_cidr}).")
+
+def apply_firewall(subnet_name, rules_file):
+    """
+    Part 4: Firewall & Security Groups
+    Applies iptables rules inside a namespace from a JSON file.
+    """
+    print(f"--- Applying firewall rules from {rules_file} to {subnet_name} ---")
+    
+    # 1. Load and parse JSON
+    try:
+        with open(rules_file, 'r') as f:
+            rules_config = json.load(f)
+    except Exception as e:
+        print(f"ERROR: Could not read or parse {rules_file}: {e}", file=sys.stderr)
+        return
+
+    ns_name = f"ns-{subnet_name}"
+    if not os.path.exists(f"/var/run/netns/{ns_name}"):
+        print(f"ERROR: Subnet namespace {ns_name} not found.", file=sys.stderr)
+        return
+
+    # 2. Set default policies
+    print("Setting default INPUT policy to DROP")
+    run_in_ns(subnet_name, "iptables -P INPUT DROP")
+    run_in_ns(subnet_name, "iptables -P FORWARD DROP")
+    run_in_ns(subnet_name, "iptables -P OUTPUT ACCEPT") # Allow outbound
+    
+    # 3. Flush old rules
+    run_in_ns(subnet_name, "iptables -F INPUT")
+    
+    # 4. Allow loopback and established traffic (standard)
+    run_in_ns(subnet_name, "iptables -A INPUT -i lo -j ACCEPT")
+    run_in_ns(subnet_name, "iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT")
+
+    # 5. Apply Ingress rules
+    for rule in rules_config.get("ingress", []):
+        port = rule["port"]
+        protocol = rule["protocol"]
+        action = "ACCEPT" if rule["action"] == "allow" else "DROP"
+        source = rule.get("source", "0.0.0.0/0") # Default to all
+        
+        rule_cmd = f"iptables -A INPUT -p {protocol} --dport {port} -s {source} -j {action}"
+        run_in_ns(subnet_name, rule_cmd)
+        
+    print(f"✅ Firewall rules applied to {subnet_name}.")
+    print(f"   -> Check with: sudo ./vpcctl exec -s {subnet_name} -- iptables -L -n -v")
+
+def exec_in_subnet(subnet_name, command):
+    """Utility to run a command inside a subnet's namespace."""
+    
+    # --- NEW FIX ---
+    # argparse.REMAINDER includes the '--' separator. We must remove it
+    # before passing it to 'ip netns exec'.
+    if command and command[0] == '--':
+        command = command[1:] # Get the actual command (everything after '--')
+    # --- END FIX ---
+
+    # Check if command is now empty after stripping '--'
+    if not command:
+        print("ERROR: No command provided after '--'.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"--- Executing in {subnet_name}: {' '.join(command)} ---")
+    
+    ns_name = f"ns-{subnet_name}"
+    if not os.path.exists(f"/var/run/netns/{ns_name}"):
+        print(f"ERROR: Subnet namespace {ns_name} not found.", file=sys.stderr)
+        return
+
+    # Use execvp to replace the python process with the new command
+    # This makes it feel like a real shell
+    args = ["sudo", "ip", "netns", "exec", ns_name] + command
+    print(f"LOG: Handing over to: {' '.join(args)}")
+    os.execvp(args[0], args)
+
+def list_resources():
+    """Utility to list all created VPC resources."""
+    print("--- Listing VPC Resources ---")
+    print("\nNetwork Namespaces (Subnets):")
+    run_cmd("ip netns list")
+    
+    print("\nBridges (VPCs):")
+    run_cmd("ip link show type bridge")
+    
+    print("\nBridge IP Addresses:")
+    run_cmd("ip -br addr show type bridge")
+    
+    print("\nNAT (POSTROUTING) Rules:")
+    run_cmd("sudo iptables -t nat -L POSTROUTING -n -v --line-numbers")
+    
+    print("\nFORWARDING Rules (Peering & NAT):")
+    run_cmd("sudo iptables -L FORWARD -n -v --line-numbers")
+
+    print("\nState Directory:")
+    run_cmd(f"ls -lR {STATE_DIR}")
+
+def cleanup_all():
+    """
+    Nuke option: Deletes all resources created by this tool.
+    This is more reliable than granular delete for a demo.
+    """
+    print("---!!!--- WARNING: Cleaning up ALL vpcctl resources ---!!!---")
+    
+    # 1. Delete all namespaces
+    print("Deleting all 'ns-*' namespaces...")
+    ns_list_cmd = "ip netns list | awk '{print $1}' | grep '^ns-'"
+    ns_list_proc = run_cmd(ns_list_cmd, shell=True, capture_output=True, check=False)
+    if ns_list_proc.stdout:
+        namespaces = ns_list_proc.stdout.strip().split('\n')
+        for ns in namespaces:
+            if ns: run_cmd(f"sudo ip netns delete {ns}", check=False)
+            
+    # --- UPDATED SECTION ---
+    # 2. Delete all bridges
+    print("Deleting all 'br-*' bridges...")
+    # This command is more robust than the previous awk-based one.
+    br_list_cmd = "ip link show type bridge | grep 'br-' | awk '{print $2}' | sed 's/://'"
+    br_list_proc = run_cmd(br_list_cmd, shell=True, capture_output=True, check=False)
+    
+    if br_list_proc.stdout:
+        bridges = br_list_proc.stdout.strip().split('\n')
+        for br in bridges:
+            if br.startswith("br-"): # Double-check it's one of ours
+                print(f"Deleting bridge: {br}")
+                run_cmd(f"sudo ip link set {br} down", check=False)
+                run_cmd(f"sudo ip link delete {br}", check=False)
+            else:
+                print(f"Skipping non-vpcctl bridge: {br}")
+    # --- END UPDATED SECTION ---
+
+    # 3. Delete all iptables rules with 'vpcctl' comments
+    print("Deleting all 'vpcctl' iptables rules...")
+    
+    def delete_rules_with_comment(table, chain, comment_prefix):
+        # We search for the comment and pipe to awk/tac to delete in reverse order
+        cmd = f"sudo iptables -t {table} -L {chain} -n --line-numbers | grep '{comment_prefix}' | awk '{{print $1}}' | tac"
+        rules_proc = run_cmd(cmd, shell=True, capture_output=True, check=False)
+        if rules_proc.stdout:
+            rule_numbers = rules_proc.stdout.strip().split('\n')
+            for num in rule_numbers:
+                if num:
+                    run_cmd(f"sudo iptables -t {table} -D {chain} {num}", check=False)
+
+    delete_rules_with_comment("nat", "POSTROUTING", "vpcctl-nat")
+    delete_rules_with_comment("filter", "FORWARD", "vpcctl-fwd")
+    delete_rules_with_comment("filter", "FORWARD", "vpcctl-peer")
+    delete_rules_with_comment("filter", "FORWARD", "vpcctl-fwd-vpc") # Added the VPC rule
+
+    # 4. Delete state directory
+    print(f"Deleting state directory: {STATE_DIR}")
+    run_cmd(f"sudo rm -rf {STATE_DIR}", check=False)
+    
+    print("✅ All vpcctl resources have been cleaned up.")
+
+
+# --- Main CLI ---
+
+# --- Main CLI ---
+
+def main():
+    # Check for root privileges
+    if os.geteuid() != 0:
+        print("ERROR: This script must be run with sudo.", file=sys.stderr)
+        print("HINT: Use 'sudo -E ./vpcctl <command>' to preserve your variables.")
+        sys.exit(1)
+
+    # Ensure state directory exists
+    os.makedirs(STATE_DIR, exist_ok=True)
+
+    # Get the command from the script argument (e.g., create-vpc)
+    if len(sys.argv) < 2:
+        print("ERROR: No command specified.")
+        print("Usage: sudo -E ./vpcctl [create-vpc|create-subnet|delete-vpc|peer-vpcs|apply-firewall|exec|list|cleanup-all]")
+        sys.exit(1)
+    
+    command = sys.argv[1]
+
+    try:
+        if command == "create-vpc":
+            VPC_NAME = os.environ.get("VPC_NAME")
+            CIDR_BLOCK = os.environ.get("CIDR_BLOCK")
+            if not VPC_NAME or not CIDR_BLOCK:
+                print("ERROR: Missing environment variables.", file=sys.stderr)
+                print("Please set: VPC_NAME, CIDR_BLOCK", file=sys.stderr)
+                sys.exit(1)
+            create_vpc(VPC_NAME, CIDR_BLOCK)
+        
+        elif command == "create-subnet":
+            VPC_NAME = os.environ.get("VPC_NAME")
+            SUBNET_NAME = os.environ.get("SUBNET_NAME")
+            SUBNET_CIDR = os.environ.get("SUBNET_CIDR")
+            SUBNET_TYPE = os.environ.get("SUBNET_TYPE")
+            INTERNET_INTERFACE = os.environ.get("INTERNET_INTERFACE") # Can be None for private
+            
+            if not VPC_NAME or not SUBNET_NAME or not SUBNET_CIDR or not SUBNET_TYPE:
+                print("ERROR: Missing environment variables.", file=sys.stderr)
+                print("Please set: VPC_NAME, SUBNET_NAME, SUBNET_CIDR, SUBNET_TYPE", file=sys.stderr)
+                sys.exit(1)
+            if SUBNET_TYPE == "public" and not INTERNET_INTERFACE:
+                print("ERROR: Public subnets require INTERNET_INTERFACE to be set.", file=sys.stderr)
+                sys.exit(1)
+                
+            create_subnet(VPC_NAME, SUBNET_NAME, SUBNET_CIDR, SUBNET_TYPE, INTERNET_INTERFACE)
+        
+        elif command == "delete-vpc":
+            VPC_NAME = os.environ.get("VPC_NAME")
+            if not VPC_NAME:
+                print("ERROR: Please set VPC_NAME.", file=sys.stderr)
+                sys.exit(1)
+            delete_vpc(VPC_NAME)
+        
+        elif command == "peer-vpcs":
+            VPC1_NAME = os.environ.get("VPC1_NAME")
+            VPC2_NAME = os.environ.get("VPC2_NAME")
+            if not VPC1_NAME or not VPC2_NAME:
+                print("ERROR: Please set VPC1_NAME and VPC2_NAME.", file=sys.stderr)
+                sys.exit(1)
+            peer_vpcs(VPC1_NAME, VPC2_NAME)
+        
+        elif command == "apply-firewall":
+            SUBNET_NAME = os.environ.get("SUBNET_NAME")
+            RULES_FILE = os.environ.get("RULES_FILE")
+            if not SUBNET_NAME or not RULES_FILE:
+                print("ERROR: Please set SUBNET_NAME and RULES_FILE.", file=sys.stderr)
+                sys.exit(1)
+            apply_firewall(SUBNET_NAME, RULES_FILE)
+        
+        elif command == "exec":
+            SUBNET_NAME = os.environ.get("SUBNET_NAME")
+            exec_command = sys.argv[2:] # Get everything after 'exec'
+            
+            if not SUBNET_NAME:
+                print("ERROR: Please set SUBNET_NAME.", file=sys.stderr)
+                sys.exit(1)
+            if not exec_command:
+                print("ERROR: Please provide a command to execute.", file=sys.stderr)
+                print("Usage: sudo -E ./vpcctl exec <command-to-run>", file=sys.stderr)
+                sys.exit(1)
+                
+            # The exec_in_subnet function already handles the '--'
+            # so we just pass the list.
+            exec_in_subnet(SUBNET_NAME, exec_command)
+        
+        elif command == "list":
+            list_resources()
+        
+        elif command == "cleanup-all":
+            cleanup_all()
+        
+        else:
+            print(f"ERROR: Unknown command '{command}'")
+            print("Usage: sudo -E ./vpcctl [create-vpc|create-subnet|delete-vpc|peer-vpcs|apply-firewall|exec|list|cleanup-all]")
+            sys.exit(1)
+            
+    except KeyboardInterrupt:
+        print("\nOperation cancelled by user.", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
