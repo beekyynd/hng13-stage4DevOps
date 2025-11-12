@@ -169,7 +169,7 @@ sudo -E ./vpcctl exec curl [http://10.0.1.10](http://10.0.1.10)
 Let's block port 80 traffic from `vpc-b`, even though they are peered.
 
 ```bash
-# 1. Create the firewall rules file
+# 1. Create the firewall rules file or use the one I added to this repository
 cat <<EOF > rules.json
 {
   "ingress": [
